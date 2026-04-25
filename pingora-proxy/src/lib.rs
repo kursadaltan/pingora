@@ -76,8 +76,8 @@ use pingora_core::server::ShutdownWatch;
 use pingora_core::upstreams::peer::{HttpPeer, Peer};
 use pingora_error::{Error, ErrorSource, ErrorType::*, OrErr, Result};
 
-// Build marker log to confirm which pingora-proxy core is running in production.
-// This is intentionally low-cardinality and logs only once per process.
+// One-shot runtime check: redirect-follow synthetic 3xx path keeps upstream pool reuse
+// (see `proxy_h1.rs` / `proxy_h2.rs`). Low-cardinality, once per process.
 static CORE_BUILD_MARKER_LOGGED: AtomicBool = AtomicBool::new(false);
 
 fn log_core_build_marker_once() {
@@ -85,13 +85,7 @@ fn log_core_build_marker_once() {
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
     {
-        // If you are debugging redirect-follow pooling issues in Medianova's fork, this line
-        // confirms whether the benign synthetic 3xx reuse patch is present at runtime.
-        //
-        // Note: the actual behavior change lives in `proxy_h1.rs` / `proxy_h2.rs`.
-        debug!(
-            "pingora-proxy core build marker: benign_redirect_follow_3xx_reuse_patch=enabled"
-        );
+        debug!("pingora-proxy: redirect_follow_3xx_reuse=on");
     }
 }
 
