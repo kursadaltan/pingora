@@ -76,6 +76,25 @@ use pingora_core::server::ShutdownWatch;
 use pingora_core::upstreams::peer::{HttpPeer, Peer};
 use pingora_error::{Error, ErrorSource, ErrorType::*, OrErr, Result};
 
+// Build marker log to confirm which pingora-proxy core is running in production.
+// This is intentionally low-cardinality and logs only once per process.
+static CORE_BUILD_MARKER_LOGGED: AtomicBool = AtomicBool::new(false);
+
+fn log_core_build_marker_once() {
+    if CORE_BUILD_MARKER_LOGGED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        // If you are debugging redirect-follow pooling issues in Medianova's fork, this line
+        // confirms whether the benign synthetic 3xx reuse patch is present at runtime.
+        //
+        // Note: the actual behavior change lives in `proxy_h1.rs` / `proxy_h2.rs`.
+        debug!(
+            "pingora-proxy core build marker: benign_redirect_follow_3xx_reuse_patch=enabled"
+        );
+    }
+}
+
 fn is_benign_upstream_retry_log(e: &Error) -> bool {
     matches!(&e.etype, HTTPStatus(code) if (300..400).contains(code))
         && e.context
@@ -152,6 +171,7 @@ impl<SV> HttpProxy<SV, ()> {
     /// // Use proxy.process_new_http() in your custom accept loop
     /// ```
     pub fn new(inner: SV, conf: Arc<ServerConf>) -> Self {
+        log_core_build_marker_once();
         HttpProxy {
             inner,
             client_upstream: Connector::new(Some(ConnectorOptions::from_server_conf(&conf))),
@@ -181,6 +201,7 @@ where
         SV: ProxyHttp + Send + Sync + 'static,
         SV::CTX: Send + Sync,
     {
+        log_core_build_marker_once();
         let client_upstream =
             Connector::new_custom(Some(ConnectorOptions::from_server_conf(&conf)), connector);
 
