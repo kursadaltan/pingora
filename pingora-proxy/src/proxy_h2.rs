@@ -213,6 +213,12 @@ where
         match ret {
             Ok((downstream_can_reuse, _upstream)) => (downstream_can_reuse, None),
             Err(e) => {
+                // Redirect-follow control flow: allow downstream reuse and (most importantly)
+                // don't mark the request as a real failure that would prevent healthy reuse.
+                // The outer retry loop will pick the next hop.
+                if is_benign_upstream_retry_log(&e) {
+                    return (true, Some(e));
+                }
                 // On application level upstream read timeouts, send RST_STREAM CANCEL,
                 // we know we have not received END_STREAM at this point since we read timed out
                 // TODO: implement for write timeouts?

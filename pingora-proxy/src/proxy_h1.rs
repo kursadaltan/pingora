@@ -128,7 +128,21 @@ where
 
         match ret {
             Ok((downstream_can_reuse, _upstream)) => (downstream_can_reuse, true, None),
-            Err(e) => (false, false, Some(e)),
+            Err(e) => {
+                // Redirect-follow control flow: `response_filter` may intentionally return a
+                // synthetic 3xx error (see `redirect_follow_hop:` context) to ask the outer
+                // proxy retry loop to perform the next hop. This is not a real I/O failure and
+                // should not poison keepalive reuse decisions for either side.
+                //
+                // In particular, returning `reuse_client=false` here prevents releasing the
+                // upstream connection back into the pool, which makes the next *client request*
+                // to the same origin open a fresh connection every time (the issue being debugged).
+                if is_benign_upstream_retry_log(&e) {
+                    (true, true, Some(e))
+                } else {
+                    (false, false, Some(e))
+                }
+            }
         }
     }
 
