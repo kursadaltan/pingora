@@ -21,6 +21,36 @@ use crate::proxy_common::*;
 use pingora_cache::CachePhase;
 use pingora_core::protocols::http::custom::CUSTOM_MESSAGE_QUEUE_SIZE;
 
+/// Best-effort drain of an H1 upstream response body so the connection's
+/// framing state is back to a clean boundary and safe to return to the pool.
+///
+/// Returns `true` only when the body has been fully consumed within `timeout`.
+/// On timeout / read error returns `false` — caller should drop the connection.
+///
+/// This is used by the redirect-follow benign-error path: when `response_filter`
+/// returns a synthetic 3xx Err, the bidirectional `try_join!` cancels the
+/// upstream reader mid-stream. Without draining, reusing the H1 connection
+/// would interleave the previous response's tail bytes with the next request's
+/// response.
+async fn drain_h1_body_with_timeout(
+    client_session: &mut HttpSessionV1,
+    timeout: std::time::Duration,
+) -> bool {
+    if client_session.is_body_done() {
+        return true;
+    }
+    let drain = async {
+        loop {
+            match client_session.read_body_bytes().await {
+                Ok(Some(_)) => continue,
+                Ok(None) => return true,
+                Err(_) => return false,
+            }
+        }
+    };
+    matches!(tokio::time::timeout(timeout, drain).await, Ok(true))
+}
+
 impl<SV, C> HttpProxy<SV, C>
 where
     C: custom::Connector,
@@ -128,7 +158,54 @@ where
 
         match ret {
             Ok((downstream_can_reuse, _upstream)) => (downstream_can_reuse, true, None),
-            Err(e) => (false, false, Some(e)),
+            Err(e) => {
+                // Redirect-follow control flow: `response_filter` may intentionally return a
+                // synthetic 3xx error (see `redirect_follow_hop:` context) to ask the outer
+                // proxy retry loop to perform the next hop. This is not a real I/O failure and
+                // should not poison keepalive reuse decisions for either side.
+                //
+                // In particular, returning `reuse_client=false` here prevents releasing the
+                // upstream connection back into the pool, which makes the next *client request*
+                // to the same origin open a fresh connection every time (the issue being debugged).
+                //
+                // SAFETY: when the synthetic Err is returned from response_filter, the
+                // bi-directional `try_join!` above cancels `proxy_handle_upstream` mid-read.
+                // The HttpSessionV1 may have framing state (chunked encoding, content-length
+                // remaining) that's not fully consumed. Reusing the connection in that state
+                // would corrupt the *next* request multiplexed on it. So we attempt a tight
+                // best-effort drain; only declare reusable if the drain completes.
+                if is_benign_upstream_retry_log(&e) {
+                    if drain_h1_body_with_timeout(
+                        client_session,
+                        std::time::Duration::from_millis(100),
+                    )
+                    .await
+                    {
+                        (true, true, Some(e))
+                    } else {
+                        // Drain failed/timed out: drop the connection. Outer retry loop
+                        // will pick a fresh one from the pool (or open one) for the
+                        // redirect target. This is still better than poisoning reuse
+                        // for *all* subsequent requests on this origin.
+                        (false, false, Some(e))
+                    }
+                } else if is_benign_downstream_disconnect(&e) {
+                    // Downstream (client) went away: not an origin failure. Still, `try_join!`
+                    // cancels the upstream reader mid-body; only allow reuse if we can drain.
+                    if drain_h1_body_with_timeout(
+                        client_session,
+                        std::time::Duration::from_millis(100),
+                    )
+                    .await
+                    {
+                        (false, true, Some(e))
+                    } else {
+                        (false, false, Some(e))
+                    }
+                } else {
+                    (false, false, Some(e))
+                }
+            }
         }
     }
 

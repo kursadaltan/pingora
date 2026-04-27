@@ -213,6 +213,28 @@ where
         match ret {
             Ok((downstream_can_reuse, _upstream)) => (downstream_can_reuse, None),
             Err(e) => {
+                // Redirect-follow control flow: allow downstream reuse and (most importantly)
+                // don't mark the request as a real failure that would prevent healthy reuse.
+                // The outer retry loop will pick the next hop.
+                //
+                // SAFETY (H2): unlike H1, framing is per-stream — so the underlying multiplexed
+                // connection is not at risk. But the *upstream stream* itself was abandoned
+                // mid-body when `response_filter` returned the synthetic Err. Send RST_STREAM
+                // CANCEL so:
+                //   1. the upstream stops sending the rest of the body (saves bandwidth)
+                //   2. our local h2 state machine reaches a clean terminal state for this id
+                // The h2 connection itself stays healthy and reusable for new streams.
+                if is_benign_upstream_retry_log(&e) {
+                    client_body.send_reset(h2::Reason::CANCEL);
+                    return (true, Some(e));
+                }
+                if is_benign_downstream_disconnect(&e) {
+                    // Downstream (client) disconnected: not an origin failure. Cancel the
+                    // upstream stream so the server stops sending; the underlying H2 conn
+                    // remains healthy/reusable for new streams.
+                    client_body.send_reset(h2::Reason::CANCEL);
+                    return (false, Some(e));
+                }
                 // On application level upstream read timeouts, send RST_STREAM CANCEL,
                 // we know we have not received END_STREAM at this point since we read timed out
                 // TODO: implement for write timeouts?

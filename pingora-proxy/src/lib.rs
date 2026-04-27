@@ -76,6 +76,31 @@ use pingora_core::server::ShutdownWatch;
 use pingora_core::upstreams::peer::{HttpPeer, Peer};
 use pingora_error::{Error, ErrorSource, ErrorType::*, OrErr, Result};
 
+// One-shot runtime check: redirect-follow synthetic 3xx path keeps upstream pool reuse
+// (see `proxy_h1.rs` / `proxy_h2.rs`). Low-cardinality, once per process.
+static CORE_BUILD_MARKER_LOGGED: AtomicBool = AtomicBool::new(false);
+
+fn log_core_build_marker_once() {
+    if CORE_BUILD_MARKER_LOGGED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        debug!("pingora-proxy: redirect_follow_3xx_reuse=on");
+    }
+}
+
+fn is_benign_upstream_retry_log(e: &Error) -> bool {
+    matches!(&e.etype, HTTPStatus(code) if (300..400).contains(code))
+        && e.context
+            .as_ref()
+            .is_some_and(|c| c.as_str().starts_with("redirect_follow_hop:"))
+}
+
+fn is_benign_downstream_disconnect(e: &Error) -> bool {
+    e.esource() == &ErrorSource::Downstream
+        && matches!(e.etype(), WriteError | ReadError | ConnectionClosed)
+}
+
 const TASK_BUFFER_SIZE: usize = 4;
 
 mod proxy_cache;
@@ -145,6 +170,7 @@ impl<SV> HttpProxy<SV, ()> {
     /// // Use proxy.process_new_http() in your custom accept loop
     /// ```
     pub fn new(inner: SV, conf: Arc<ServerConf>) -> Self {
+        log_core_build_marker_once();
         HttpProxy {
             inner,
             client_upstream: Connector::new(Some(ConnectorOptions::from_server_conf(&conf))),
@@ -174,6 +200,7 @@ where
         SV: ProxyHttp + Send + Sync + 'static,
         SV::CTX: Send + Sync,
     {
+        log_core_build_marker_once();
         let client_upstream =
             Connector::new_custom(Some(ConnectorOptions::from_server_conf(&conf)), connector);
 
@@ -977,13 +1004,23 @@ where
                         break;
                     }
                     // only log error that will be retried here, the final error will be logged below
-                    warn!(
-                        "Fail to proxy: {}, tries: {}, retry: {}, {}",
-                        proxy_error.as_ref().unwrap(),
-                        retries,
-                        retry,
-                        self.inner.request_summary(&session, &ctx)
-                    );
+                    if is_benign_upstream_retry_log(proxy_error.as_ref().unwrap()) {
+                        debug!(
+                            "Redirect follow: {}, tries: {}, retry: {}, {}",
+                            proxy_error.as_ref().unwrap(),
+                            retries,
+                            retry,
+                            self.inner.request_summary(&session, &ctx)
+                        );
+                    } else {
+                        warn!(
+                            "Fail to proxy: {}, tries: {}, retry: {}, {}",
+                            proxy_error.as_ref().unwrap(),
+                            retries,
+                            retry,
+                            self.inner.request_summary(&session, &ctx)
+                        );
+                    }
                 }
                 None => {
                     proxy_error = None;
