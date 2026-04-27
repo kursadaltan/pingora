@@ -316,6 +316,13 @@ where
                             // So that this function could read the rest events from rx including
                             // the closure, then exit.
                             if result.is_err() && !client_session.was_upgraded() {
+                                // Non-upgraded: downstream pipe closed almost always means the
+                                // downstream/client connection is gone. Don't surface as an
+                                // internal error; let the downstream task's error decide the
+                                // final outcome and allow outer logic to treat it as benign.
+                                if tx.is_closed() {
+                                    return Ok(());
+                                }
                                 return result;
                             }
                         },
