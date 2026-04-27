@@ -36,6 +36,12 @@ async fn drain_h1_body_with_timeout(
     client_session: &mut HttpSessionV1,
     timeout: std::time::Duration,
 ) -> bool {
+    // If we haven't successfully read a response header yet, we must NOT try to
+    // initialize/drain the body reader: pingora-core's H1 body reader depends on
+    // preread header parsing state. In this case, safest is to drop the conn.
+    if client_session.resp_header().is_none() {
+        return false;
+    }
     if client_session.is_body_done() {
         return true;
     }
