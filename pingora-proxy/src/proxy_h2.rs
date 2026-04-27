@@ -216,7 +216,16 @@ where
                 // Redirect-follow control flow: allow downstream reuse and (most importantly)
                 // don't mark the request as a real failure that would prevent healthy reuse.
                 // The outer retry loop will pick the next hop.
+                //
+                // SAFETY (H2): unlike H1, framing is per-stream — so the underlying multiplexed
+                // connection is not at risk. But the *upstream stream* itself was abandoned
+                // mid-body when `response_filter` returned the synthetic Err. Send RST_STREAM
+                // CANCEL so:
+                //   1. the upstream stops sending the rest of the body (saves bandwidth)
+                //   2. our local h2 state machine reaches a clean terminal state for this id
+                // The h2 connection itself stays healthy and reusable for new streams.
                 if is_benign_upstream_retry_log(&e) {
+                    client_body.send_reset(h2::Reason::CANCEL);
                     return (true, Some(e));
                 }
                 // On application level upstream read timeouts, send RST_STREAM CANCEL,
