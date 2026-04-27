@@ -228,6 +228,13 @@ where
                     client_body.send_reset(h2::Reason::CANCEL);
                     return (true, Some(e));
                 }
+                if is_benign_downstream_disconnect(&e) {
+                    // Downstream (client) disconnected: not an origin failure. Cancel the
+                    // upstream stream so the server stops sending; the underlying H2 conn
+                    // remains healthy/reusable for new streams.
+                    client_body.send_reset(h2::Reason::CANCEL);
+                    return (false, Some(e));
+                }
                 // On application level upstream read timeouts, send RST_STREAM CANCEL,
                 // we know we have not received END_STREAM at this point since we read timed out
                 // TODO: implement for write timeouts?

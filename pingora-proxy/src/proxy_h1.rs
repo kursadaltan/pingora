@@ -189,6 +189,19 @@ where
                         // for *all* subsequent requests on this origin.
                         (false, false, Some(e))
                     }
+                } else if is_benign_downstream_disconnect(&e) {
+                    // Downstream (client) went away: not an origin failure. Still, `try_join!`
+                    // cancels the upstream reader mid-body; only allow reuse if we can drain.
+                    if drain_h1_body_with_timeout(
+                        client_session,
+                        std::time::Duration::from_millis(100),
+                    )
+                    .await
+                    {
+                        (false, true, Some(e))
+                    } else {
+                        (false, false, Some(e))
+                    }
                 } else {
                     (false, false, Some(e))
                 }

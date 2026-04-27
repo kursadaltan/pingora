@@ -96,6 +96,11 @@ fn is_benign_upstream_retry_log(e: &Error) -> bool {
             .is_some_and(|c| c.as_str().starts_with("redirect_follow_hop:"))
 }
 
+fn is_benign_downstream_disconnect(e: &Error) -> bool {
+    e.esource() == &ErrorSource::Downstream
+        && matches!(e.etype(), WriteError | ReadError | ConnectionClosed)
+}
+
 const TASK_BUFFER_SIZE: usize = 4;
 
 mod proxy_cache;
