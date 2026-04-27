@@ -623,7 +623,20 @@ impl HttpSession {
     fn init_body_reader(&mut self) {
         if self.body_reader.need_init() {
             // follow https://datatracker.ietf.org/doc/html/rfc9112#section-6.3
-            let preread_body = self.preread_body.as_ref().unwrap().get(&self.buf[..]);
+            let Some(preread) = self.preread_body.as_ref() else {
+                // Invariant broken: body reader is being initialized before a completed response
+                // header parse has set preread segmentation state. This must never panic in
+                // production. Fail-safe behavior:
+                // - never reuse this connection
+                // - treat response body as empty/done to avoid consuming bytes with unknown framing
+                self.keepalive_timeout = KeepaliveStatus::Off;
+                self.body_reader.init_content_length(0, b"");
+                log::error!(
+                    "BUG: http1 client preread_body is None while initializing body reader; forcing connection close"
+                );
+                return;
+            };
+            let preread_body = preread.get(&self.buf[..]);
 
             let upgraded = if let Some(code) = self.get_status() {
                 match code.as_u16() {
