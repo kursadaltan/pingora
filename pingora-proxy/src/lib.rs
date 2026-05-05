@@ -144,6 +144,8 @@ where
     pub server_options: Option<HttpServerOptions>,
     pub h2_options: Option<H2Options>,
     pub downstream_modules: HttpModules,
+    #[cfg(feature = "upstream_modules")]
+    pub upstream_modules: HttpModules,
     max_retries: usize,
     process_custom_session: Option<ProcessCustomSession<SV, C>>,
 }
@@ -179,6 +181,8 @@ impl<SV> HttpProxy<SV, ()> {
             server_options: None,
             h2_options: None,
             downstream_modules: HttpModules::new(),
+            #[cfg(feature = "upstream_modules")]
+            upstream_modules: HttpModules::new(),
             max_retries: conf.max_retries,
             process_custom_session: None,
         }
@@ -211,6 +215,8 @@ where
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             server_options,
             downstream_modules: HttpModules::new(),
+            #[cfg(feature = "upstream_modules")]
+            upstream_modules: HttpModules::new(),
             max_retries: conf.max_retries,
             process_custom_session: on_custom,
             h2_options: None,
@@ -242,6 +248,8 @@ where
     {
         self.inner
             .init_downstream_modules(&mut self.downstream_modules);
+        #[cfg(feature = "upstream_modules")]
+        self.inner.init_upstream_modules(&mut self.upstream_modules);
     }
 
     async fn handle_new_request(
@@ -502,6 +510,10 @@ pub struct Session {
     pub subrequest_spawner: Option<SubrequestSpawner>,
     // Downstream filter modules
     pub downstream_modules_ctx: HttpModuleCtx,
+    /// Upstream filter modules. These run before `upstream_compression` and see the raw
+    /// (pre-compression) upstream response body.
+    #[cfg(feature = "upstream_modules")]
+    pub upstream_modules_ctx: HttpModuleCtx,
     /// Upstream response body bytes received (payload only). Set by proxy layer.
     /// TODO: move this into an upstream session digest for future fields.
     upstream_body_bytes_received: usize,
@@ -517,6 +529,7 @@ impl Session {
     fn new(
         downstream_session: impl Into<Box<HttpSession>>,
         downstream_modules: &HttpModules,
+        #[cfg(feature = "upstream_modules")] upstream_modules: &HttpModules,
         shutdown_flag: Arc<AtomicBool>,
     ) -> Self {
         Session {
@@ -529,6 +542,8 @@ impl Session {
             subrequest_ctx: None,
             subrequest_spawner: None, // optionally set later on
             downstream_modules_ctx: downstream_modules.build_ctx(),
+            #[cfg(feature = "upstream_modules")]
+            upstream_modules_ctx: upstream_modules.build_ctx(),
             upstream_body_bytes_received: 0,
             upstream_write_pending_time: Duration::ZERO,
             h1_skip_downstream_response: false,
@@ -546,6 +561,8 @@ impl Session {
         Self::new(
             Box::new(HttpSession::new_http1(stream)),
             &modules,
+            #[cfg(feature = "upstream_modules")]
+            &HttpModules::new(),
             Arc::new(AtomicBool::new(false)),
         )
     }
@@ -558,8 +575,45 @@ impl Session {
         Self::new(
             Box::new(HttpSession::new_http1(stream)),
             downstream_modules,
+            #[cfg(feature = "upstream_modules")]
+            &HttpModules::new(),
             Arc::new(AtomicBool::new(false)),
         )
+    }
+
+    /// Run upstream module filters on the given [`HttpTask`].
+    ///
+    /// Upstream modules process each task **before** `upstream_compression` and
+    /// see the raw (pre-compression) upstream response. Like the downstream
+    /// module path, `response_trailer_filter` and `response_done_filter` return
+    /// values are converted to body tasks when present.
+    #[cfg(feature = "upstream_modules")]
+    pub async fn upstream_modules_filter_task(&mut self, t: &mut HttpTask) -> Result<()> {
+        match t {
+            HttpTask::Header(header, eos) => {
+                self.upstream_modules_ctx
+                    .response_header_filter(header, *eos)
+                    .await?;
+            }
+            HttpTask::Body(body, eos) | HttpTask::UpgradedBody(body, eos) => {
+                self.upstream_modules_ctx.response_body_filter(body, *eos)?;
+            }
+            HttpTask::Trailer(trailers) => {
+                if let Some(buf) = self
+                    .upstream_modules_ctx
+                    .response_trailer_filter(trailers)?
+                {
+                    *t = HttpTask::Body(Some(buf), true);
+                }
+            }
+            HttpTask::Done => {
+                if let Some(buf) = self.upstream_modules_ctx.response_done_filter()? {
+                    *t = HttpTask::Body(Some(buf), true);
+                }
+            }
+            HttpTask::Failed(_) => {}
+        }
+        Ok(())
     }
 
     pub fn as_downstream_mut(&mut self) -> &mut HttpSession {
@@ -1157,6 +1211,8 @@ where
             Some(downstream_session) => Session::new(
                 downstream_session,
                 &self.downstream_modules,
+                #[cfg(feature = "upstream_modules")]
+                &self.upstream_modules,
                 self.shutdown_flag.clone(),
             ),
             None => return, // bad request
@@ -1284,6 +1340,8 @@ where
             Some(downstream_session) => Session::new(
                 downstream_session,
                 &self.downstream_modules,
+                #[cfg(feature = "upstream_modules")]
+                &self.upstream_modules,
                 self.shutdown_flag.clone(),
             ),
             None => return None, // bad request
