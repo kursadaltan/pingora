@@ -67,6 +67,8 @@ pub struct ConnectorOptions {
     pub debug_ssl_keylog: bool,
     /// How many connections to keepalive
     pub keepalive_pool_size: usize,
+    /// Internal shard count for the keepalive pool (reduces RwLock contention)
+    pub keepalive_pool_shards: usize,
     /// Optionally offload the connection establishment to dedicated thread pools
     ///
     /// TCP and TLS connection establishment can be CPU intensive. Sometimes such tasks can slow
@@ -117,6 +119,7 @@ impl ConnectorOptions {
             s2n_config_cache_size: server_conf.s2n_config_cache_size,
             debug_ssl_keylog: server_conf.upstream_debug_ssl_keylog,
             keepalive_pool_size: server_conf.upstream_keepalive_pool_size,
+            keepalive_pool_shards: server_conf.upstream_keepalive_pool_shards.max(1),
             offload_threadpool,
             bind_to_v4,
             bind_to_v6,
@@ -132,6 +135,7 @@ impl ConnectorOptions {
             cert_key_file: None,
             debug_ssl_keylog: false,
             keepalive_pool_size,
+            keepalive_pool_shards: 1,
             offload_threadpool: None,
             bind_to_v4: vec![],
             bind_to_v6: vec![],
@@ -160,6 +164,9 @@ impl TransportConnector {
         let pool_size = options
             .as_ref()
             .map_or(DEFAULT_POOL_SIZE, |c| c.keepalive_pool_size);
+        let shard_count = options
+            .as_ref()
+            .map_or(1, |c| c.keepalive_pool_shards.max(1));
         // Take the offloading setting there because this layer has implement offloading,
         // so no need for stacks at lower layer to offload again.
         let offload = options.as_mut().and_then(|o| o.offload_threadpool.take());
@@ -171,7 +178,7 @@ impl TransportConnector {
             .map_or_else(Vec::new, |o| o.bind_to_v6.clone());
         TransportConnector {
             tls_ctx: tls::Connector::new(options),
-            connection_pool: Arc::new(ConnectionPool::new(pool_size)),
+            connection_pool: Arc::new(ConnectionPool::new_with_shards(pool_size, shard_count)),
             offload: offload.map(|v| OffloadRuntime::new(v.0, v.1)),
             bind_to_v4,
             bind_to_v6,

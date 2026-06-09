@@ -136,7 +136,7 @@ impl<T> PoolNode<T> {
     /// an exclusive (write) lock before actually removing the node from the parent
     /// pool HashMap. A false-negative simply defers cleanup to the next opportunity;
     /// a false-positive is largely mitigated by the re-check (see
-    /// [`ConnectionPool::try_remove_empty_node`] for residual race-window analysis).
+    /// [`PoolShard::try_remove_empty_node`] for residual race-window analysis).
     pub fn is_empty(&self) -> bool {
         // Check the lock-free queue first (cheap atomic load) to avoid acquiring
         // the mutex in the common case where connections are present.
@@ -176,23 +176,16 @@ impl<T> PoolNode<T> {
     }
 }
 
-/// Connection pool
-///
-/// [ConnectionPool] holds reusable connections. A reusable connection is released to this pool to
-/// be picked up by another user/request.
-pub struct ConnectionPool<S> {
-    // TODO: n-way pools to reduce lock contention
+/// A single shard of the connection pool (own HashMap + LRU).
+struct PoolShard<S> {
     pool: RwLock<HashMap<GroupKey, Arc<PoolNode<PoolConnection<S>>>>>,
     lru: Lru<ID, ConnectionMeta>,
 }
 
-impl<S> ConnectionPool<S> {
-    /// Create a new [ConnectionPool] with a size limit.
-    ///
-    /// When a connection is released to this pool, the least recently used connection will be dropped.
-    pub fn new(size: usize) -> Self {
-        ConnectionPool {
-            pool: RwLock::new(HashMap::with_capacity(size)), // this is oversized since some connections will have the same key
+impl<S> PoolShard<S> {
+    fn new(size: usize) -> Self {
+        PoolShard {
+            pool: RwLock::new(HashMap::with_capacity(size)),
             lru: Lru::new(size),
         }
     }
@@ -277,14 +270,13 @@ impl<S> ConnectionPool<S> {
         }
     }
 
-    pub fn pop_closed(&self, meta: &ConnectionMeta) {
+    fn pop_closed(&self, meta: &ConnectionMeta) {
         // NOTE: which of these should be done first?
         self.pop_evicted(meta);
         self.lru.pop(&meta.id);
     }
 
-    /// Get a connection from this pool under the same group key
-    pub fn get(&self, key: &GroupKey) -> Option<S> {
+    fn get(&self, key: &GroupKey) -> Option<S> {
         let pool_node = {
             let pool = self.pool.read();
             match pool.get(key) {
@@ -312,15 +304,7 @@ impl<S> ConnectionPool<S> {
         }
     }
 
-    /// Release a connection to this pool for reuse
-    ///
-    /// - The returned [`Arc<Notify>`] will notify any listen when the connection is evicted from the pool.
-    /// - The returned [`oneshot::Receiver<bool>`] will notify when the connection is being picked up by [Self::get()].
-    pub fn put(
-        &self,
-        meta: &ConnectionMeta,
-        connection: S,
-    ) -> (Arc<Notify>, oneshot::Receiver<bool>) {
+    fn put(&self, meta: &ConnectionMeta, connection: S) -> (Arc<Notify>, oneshot::Receiver<bool>) {
         let (notify_close, replaced) = self.lru.add(meta.id, meta.clone());
         if let Some(meta) = replaced {
             self.pop_evicted(&meta);
@@ -332,13 +316,7 @@ impl<S> ConnectionPool<S> {
         (notify_close, watch_use)
     }
 
-    /// Actively monitor the health of a connection that is already released to this pool
-    ///
-    /// When the connection breaks, or the optional `timeout` is reached this function will
-    /// remove it from the pool and drop the connection.
-    ///
-    /// If the connection is reused via [Self::get()] or being evicted, this function will just exit.
-    pub async fn idle_poll<Stream>(
+    async fn idle_poll<Stream>(
         &self,
         connection: OwnedMutexGuard<Stream>,
         meta: &ConnectionMeta,
@@ -379,11 +357,7 @@ impl<S> ConnectionPool<S> {
         self.pop_closed(meta);
     }
 
-    /// Passively wait to close the connection after the timeout
-    ///
-    /// If this connection is not being picked up or evicted before the timeout is reach, this
-    /// function will remove it from the pool and close the connection.
-    pub async fn idle_timeout(
+    async fn idle_timeout(
         &self,
         meta: &ConnectionMeta,
         timeout: Option<Duration>,
@@ -411,6 +385,114 @@ impl<S> ConnectionPool<S> {
                 self.pop_closed(meta);
             }
         };
+    }
+}
+
+/// Connection pool
+///
+/// [ConnectionPool] holds reusable connections. A reusable connection is released to this pool to
+/// be picked up by another user/request. Lock contention is reduced via internal shards (see
+/// [`Self::new_with_shards`]).
+pub struct ConnectionPool<S> {
+    shards: Vec<PoolShard<S>>,
+}
+
+impl<S> ConnectionPool<S> {
+    /// Create a new [ConnectionPool] with a size limit (single shard).
+    ///
+    /// When a connection is released to this pool, the least recently used connection will be dropped.
+    pub fn new(size: usize) -> Self {
+        Self::new_with_shards(size, 1)
+    }
+
+    /// Create a new [ConnectionPool] sharded into `shard_count` independent pools.
+    ///
+    /// Total LRU capacity remains `total_size`; each shard gets `total_size / shard_count`
+    /// (minimum 1 per shard). Routing uses `reuse_hash % shard_count`.
+    pub fn new_with_shards(total_size: usize, shard_count: usize) -> Self {
+        let shard_count = shard_count.max(1).min(64);
+        let per_shard = (total_size / shard_count).max(1);
+        let shards = (0..shard_count)
+            .map(|_| PoolShard::new(per_shard))
+            .collect();
+        ConnectionPool { shards }
+    }
+
+    fn shard_index(&self, key: GroupKey) -> usize {
+        (key as usize) % self.shards.len()
+    }
+
+    fn shard_for_key(&self, key: GroupKey) -> &PoolShard<S> {
+        &self.shards[self.shard_index(key)]
+    }
+
+    #[cfg(test)]
+    fn pool_map_len(&self) -> usize {
+        self.shards.iter().map(|s| s.pool.read().len()).sum()
+    }
+
+    #[cfg(test)]
+    fn pool_has_key(&self, key: GroupKey) -> bool {
+        self.shard_for_key(key).pool.read().contains_key(&key)
+    }
+
+    pub fn pop_closed(&self, meta: &ConnectionMeta) {
+        self.shard_for_key(meta.key).pop_closed(meta);
+    }
+
+    /// Get a connection from this pool under the same group key
+    pub fn get(&self, key: &GroupKey) -> Option<S> {
+        self.shard_for_key(*key).get(key)
+    }
+
+    /// Release a connection to this pool for reuse
+    ///
+    /// - The returned [`Arc<Notify>`] will notify any listen when the connection is evicted from the pool.
+    /// - The returned [`oneshot::Receiver<bool>`] will notify when the connection is being picked up by [Self::get()].
+    pub fn put(
+        &self,
+        meta: &ConnectionMeta,
+        connection: S,
+    ) -> (Arc<Notify>, oneshot::Receiver<bool>) {
+        self.shard_for_key(meta.key).put(meta, connection)
+    }
+
+    /// Actively monitor the health of a connection that is already released to this pool
+    ///
+    /// When the connection breaks, or the optional `timeout` is reached this function will
+    /// remove it from the pool and drop the connection.
+    ///
+    /// If the connection is reused via [Self::get()] or being evicted, this function will just exit.
+    pub async fn idle_poll<Stream>(
+        &self,
+        connection: OwnedMutexGuard<Stream>,
+        meta: &ConnectionMeta,
+        timeout: Option<Duration>,
+        notify_evicted: Arc<Notify>,
+        watch_use: oneshot::Receiver<bool>,
+    ) where
+        Stream: AsyncRead + Unpin + Send,
+    {
+        self.shard_for_key(meta.key)
+            .idle_poll(connection, meta, timeout, notify_evicted, watch_use)
+            .await
+    }
+
+    /// Passively wait to close the connection after the timeout
+    ///
+    /// If this connection is not being picked up or evicted before the timeout is reach, this
+    /// function will remove it from the pool and close the connection.
+    pub async fn idle_timeout(
+        &self,
+        meta: &ConnectionMeta,
+        timeout: Option<Duration>,
+        notify_evicted: Arc<Notify>,
+        notify_closed: watch::Receiver<bool>,
+        watch_use: oneshot::Receiver<bool>,
+    ) {
+        self.shard_for_key(meta.key)
+            .idle_timeout(meta, timeout, notify_evicted, notify_closed, watch_use)
+            .await
     }
 }
 
@@ -648,12 +730,12 @@ mod tests {
         let cp: ConnectionPool<String> = ConnectionPool::new(2);
         cp.put(&meta, "v1".to_string());
 
-        assert_eq!(cp.pool.read().len(), 1, "pool should have 1 node");
+        assert_eq!(cp.pool_map_len(), 1, "pool should have 1 node");
 
         cp.pop_closed(&meta);
 
         assert_eq!(
-            cp.pool.read().len(),
+            cp.pool_map_len(),
             0,
             "empty PoolNode should be removed after pop_closed"
         );
@@ -669,13 +751,13 @@ mod tests {
         let cp: ConnectionPool<String> = ConnectionPool::new(2);
         cp.put(&meta, "v1".to_string());
 
-        assert_eq!(cp.pool.read().len(), 1);
+        assert_eq!(cp.pool_map_len(), 1);
 
         let conn = cp.get(&meta.key);
         assert!(conn.is_some());
 
         assert_eq!(
-            cp.pool.read().len(),
+            cp.pool_map_len(),
             0,
             "empty PoolNode should be removed after get() takes the last connection"
         );
@@ -694,11 +776,11 @@ mod tests {
         // Remove both connections via pop_closed, but the first pop_closed
         // won't remove the node since meta2 is still there.
         cp.pop_closed(&meta1);
-        assert_eq!(cp.pool.read().len(), 1, "node should still exist");
+        assert_eq!(cp.pool_map_len(), 1, "node should still exist");
 
         cp.pop_closed(&meta2);
         assert_eq!(
-            cp.pool.read().len(),
+            cp.pool_map_len(),
             0,
             "node should be removed after last connection is popped"
         );
@@ -717,10 +799,10 @@ mod tests {
         cp.pop_closed(&meta1);
 
         assert!(
-            cp.pool.read().contains_key(&101),
+            cp.pool_has_key(101),
             "node should still exist because meta2's connection is still in it"
         );
-        assert_eq!(cp.pool.read().len(), 1);
+        assert_eq!(cp.pool_map_len(), 1);
 
         // The remaining connection should still be retrievable
         let conn = cp.get(&meta1.key);
@@ -736,18 +818,18 @@ mod tests {
         cp.put(&meta_a, "a".to_string());
         cp.put(&meta_b, "b".to_string());
 
-        assert_eq!(cp.pool.read().len(), 2);
+        assert_eq!(cp.pool_map_len(), 2);
 
         // Remove all connections for key 101
         cp.pop_closed(&meta_a);
 
         assert_eq!(
-            cp.pool.read().len(),
+            cp.pool_map_len(),
             1,
             "only key 101's empty node should be removed"
         );
-        assert!(!cp.pool.read().contains_key(&101), "key 101 should be gone");
-        assert!(cp.pool.read().contains_key(&202), "key 202 should remain");
+        assert!(!cp.pool_has_key(101), "key 101 should be gone");
+        assert!(cp.pool_has_key(202), "key 202 should remain");
 
         // key 202's connection should still be retrievable
         let conn = cp.get(&meta_b.key);
@@ -763,16 +845,16 @@ mod tests {
         let cp: ConnectionPool<String> = ConnectionPool::new(1);
 
         cp.put(&meta1, "v1".to_string());
-        assert_eq!(cp.pool.read().len(), 1);
+        assert_eq!(cp.pool_map_len(), 1);
 
         // This put evicts meta1 (LRU size = 1), making key 101's node empty.
         cp.put(&meta2, "v2".to_string());
 
         assert!(
-            !cp.pool.read().contains_key(&101),
+            !cp.pool_has_key(101),
             "key 101's empty node should be removed after its only connection was evicted"
         );
-        assert!(cp.pool.read().contains_key(&202));
+        assert!(cp.pool_has_key(202));
     }
 
     #[tokio::test]
@@ -784,20 +866,57 @@ mod tests {
         cp.put(&meta1, "first".to_string());
 
         cp.pop_closed(&meta1);
-        assert_eq!(cp.pool.read().len(), 0, "node should be cleaned up");
+        assert_eq!(cp.pool_map_len(), 0, "node should be cleaned up");
 
         // Re-insert for the same key
         let meta2 = ConnectionMeta::new(101, 2);
         cp.put(&meta2, "second".to_string());
 
-        assert_eq!(cp.pool.read().len(), 1);
+        assert_eq!(cp.pool_map_len(), 1);
         let conn = cp.get(&meta2.key);
         assert_eq!(conn, Some("second".to_string()));
 
         assert_eq!(
-            cp.pool.read().len(),
+            cp.pool_map_len(),
             0,
             "node should be cleaned up again after get"
         );
+    }
+
+    #[tokio::test]
+    async fn test_sharded_pool_distributes_across_shards() {
+        // total_size=4, 2 shards => per_shard=2 LRU each
+        let cp: ConnectionPool<String> = ConnectionPool::new_with_shards(4, 2);
+
+        // key 100 -> shard 0, key 101 -> shard 1
+        let meta_a1 = ConnectionMeta::new(100, 1);
+        let meta_a2 = ConnectionMeta::new(100, 2);
+        let meta_b1 = ConnectionMeta::new(101, 3);
+        let meta_b2 = ConnectionMeta::new(101, 4);
+
+        let (notify_a1, _) = cp.put(&meta_a1, "a1".to_string());
+        cp.put(&meta_a2, "a2".to_string());
+        cp.put(&meta_b1, "b1".to_string());
+        cp.put(&meta_b2, "b2".to_string());
+
+        assert!(cp.pool_has_key(100));
+        assert!(cp.pool_has_key(101));
+        assert_eq!(cp.pool_map_len(), 2);
+
+        // Eviction is per-shard: third put on shard 0 evicts meta_a1 (LRU)
+        let meta_a3 = ConnectionMeta::new(100, 5);
+        cp.put(&meta_a3, "a3".to_string());
+
+        let closed = tokio::select! {
+            _ = notify_a1.notified() => true,
+            _ = tokio::time::sleep(Duration::from_secs(1)) => false,
+        };
+        assert!(closed, "meta_a1 should be evicted from shard 0 only");
+
+        // shard 1 unaffected
+        assert_eq!(cp.get(&101), Some("b1".to_string()));
+        assert_eq!(cp.get(&100), Some("a2".to_string()));
+        assert_eq!(cp.get(&100), Some("a3".to_string()));
+        assert!(cp.get(&100).is_none());
     }
 }
