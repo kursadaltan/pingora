@@ -289,13 +289,10 @@ impl Connector {
         let pool_size = options
             .as_ref()
             .map_or(DEFAULT_POOL_SIZE, |o| o.keepalive_pool_size);
-        let shard_count = options
-            .as_ref()
-            .map_or(1, |o| o.keepalive_pool_shards.max(1));
         // connection offload is handled by the [TransportConnector]
         Connector {
             transport: TransportConnector::new(options),
-            idle_pool: Arc::new(ConnectionPool::new_with_shards(pool_size, shard_count)),
+            idle_pool: Arc::new(ConnectionPool::new(pool_size)),
             in_use_pool: InUsePool::new(),
         }
     }

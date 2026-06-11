@@ -93,10 +93,6 @@ pub struct ServerConf {
     /// [`ConnectorOptions`](crate::connectors::ConnectorOptions).
     /// Note: this is an _unstable_ field that may be renamed or removed in the future.
     pub upstream_keepalive_pool_size: usize,
-    /// Internal shard count for upstream keepalive pool (reduces RwLock contention).
-    /// Total LRU cap remains `upstream_keepalive_pool_size`; each shard gets size/shards.
-    /// Note: this is an _unstable_ field that may be renamed or removed in the future.
-    pub upstream_keepalive_pool_shards: usize,
     /// Number of dedicated thread pools to use for upstream connection establishment.
     /// See [`ConnectorOptions`](crate::connectors::ConnectorOptions).
     /// Note: this is an _unstable_ field that may be renamed or removed in the future.
@@ -191,7 +187,6 @@ impl Default for ServerConf {
             listener_tasks_per_fd: 1,
             work_stealing: true,
             upstream_keepalive_pool_size: 128,
-            upstream_keepalive_pool_shards: 1,
             upstream_connect_offload_threadpools: None,
             upstream_connect_offload_thread_per_pool: None,
             grace_period_seconds: None,
@@ -366,7 +361,6 @@ mod tests {
             listener_tasks_per_fd: 1,
             work_stealing: true,
             upstream_keepalive_pool_size: 4,
-            upstream_keepalive_pool_shards: 1,
             upstream_connect_offload_threadpools: None,
             upstream_connect_offload_thread_per_pool: None,
             grace_period_seconds: None,
